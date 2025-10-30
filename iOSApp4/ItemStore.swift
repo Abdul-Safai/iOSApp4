@@ -17,9 +17,11 @@ final class ItemStore: ObservableObject {
         self.uid = uid
         observeItems()
     }
-    deinit { if let handle { FirebaseManager.itemsRef(uid: uid).removeObserver(withHandle: handle) } }
+    deinit {
+        if let handle { FirebaseManager.itemsRef(uid: uid).removeObserver(withHandle: handle) }
+    }
 
-    // Live list
+    // LIVE list from Realtime DB
     func observeItems() {
         handle = FirebaseManager.itemsRef(uid: uid)
             .queryOrdered(byChild: "createdAt")
@@ -51,7 +53,7 @@ final class ItemStore: ObservableObject {
         }
     }
 
-    // Upload with progress → save download URL to the item
+    // Upload image → Storage, then save download URL back to item
     func uploadImage(_ image: UIImage, for item: Item) {
         guard let data = image.jpegData(compressionQuality: 0.85) else {
             errorMessage = "Could not encode image."; return

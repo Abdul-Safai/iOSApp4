@@ -2,7 +2,6 @@ import Foundation
 import FirebaseDatabase
 import FirebaseStorage
 
-/// Per-user database & storage roots (secured by rules)
 enum FirebaseManager {
     static func itemsRef(uid: String) -> DatabaseReference {
         Database.database().reference()

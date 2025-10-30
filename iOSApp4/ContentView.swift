@@ -67,7 +67,8 @@ struct ContentView: View {
                                             .clipShape(RoundedRectangle(cornerRadius: 12))
                                     case .failure:
                                         Text("Image failed to load").foregroundStyle(.secondary)
-                                    @unknown default: EmptyView()
+                                    @unknown default:
+                                        EmptyView()
                                     }
                                 }
                             }
