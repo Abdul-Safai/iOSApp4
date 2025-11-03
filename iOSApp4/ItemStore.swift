@@ -1,92 +1,202 @@
-import Foundation
+// ItemStore.swift
+import SwiftUI
+import FirebaseAuth
 import FirebaseDatabase
 import FirebaseStorage
-import UIKit
 
+// MARK: - AppItem model (renamed to avoid conflicts)
+struct AppItem: Identifiable, Codable, Equatable {
+    let id: String
+    var title: String
+    var createdAt: TimeInterval            // seconds since 1970
+    var imageURL: String?
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        createdAt: TimeInterval = Date().timeIntervalSince1970,
+        imageURL: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.imageURL = imageURL
+    }
+
+    // Write to RTDB
+    var asDict: [String: Any] {
+        var dict: [String: Any] = [
+            "id": id,
+            "title": title,
+            "createdAt": createdAt
+        ]
+        if let url = imageURL { dict["imageURL"] = url }
+        return dict
+    }
+
+    // Read from RTDB
+    init?(from dict: [String: Any]) {
+        guard
+            let id = dict["id"] as? String,
+            let title = dict["title"] as? String,
+            let createdAt = dict["createdAt"] as? TimeInterval
+        else { return nil }
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.imageURL = dict["imageURL"] as? String
+    }
+}
+
+extension AppItem {
+    var createdAtFormatted: String {
+        let d = Date(timeIntervalSince1970: createdAt)
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f.string(from: d)
+    }
+}
+
+// MARK: - Store
 @MainActor
 final class ItemStore: ObservableObject {
-    @Published var items: [Item] = []
+    @Published var items: [AppItem] = []
+    @Published var notice: String?
+    @Published var isUploading = false
     @Published var uploadProgress: Double = 0
-    @Published var isUploading: Bool = false
-    @Published var errorMessage: String?
 
-    private var handle: DatabaseHandle?
-    private let uid: String
-
-    init(uid: String) {
-        self.uid = uid
-        observeItems()
-    }
-    deinit {
-        if let handle { FirebaseManager.itemsRef(uid: uid).removeObserver(withHandle: handle) }
+    private var uid: String?
+    private var baseRef: DatabaseReference? {
+        uid.map { Database.database().reference().child("users").child($0).child("items") }
     }
 
-    // LIVE list from Realtime DB
-    func observeItems() {
-        handle = FirebaseManager.itemsRef(uid: uid)
-            .queryOrdered(byChild: "createdAt")
-            .observe(.value, with: { [weak self] snap in
-                var list: [Item] = []
-                for child in snap.children {
-                    if let s = child as? DataSnapshot,
-                       let dict = s.value as? [String: Any],
-                       let item = Item.from(dict) { list.append(item) }
-                }
+    init() {
+        Task { await ensureAuthAndStart() }
+    }
+
+    // MARK: - Auth & live sync
+    private func ensureAuthAndStart() async {
+        if Auth.auth().currentUser == nil {
+            _ = try? await Auth.auth().signInAnonymously()
+        }
+        uid = Auth.auth().currentUser?.uid
+        startListening()
+    }
+
+    private func startListening() {
+        guard let ref = baseRef else {
+            notice = "Waiting for Firebase sign-in…"
+            return
+        }
+
+        ref.observe(.value) { [weak self] snap in
+            var list: [AppItem] = []
+            for child in snap.children {
+                guard
+                    let s = child as? DataSnapshot,
+                    let dict = s.value as? [String: Any],
+                    let item = AppItem(from: dict)
+                else { continue }
+                list.append(item)
+            }
+            DispatchQueue.main.async {
                 self?.items = list.sorted { $0.createdAt > $1.createdAt }
-            }, withCancel: { [weak self] err in
-                self?.errorMessage = err.localizedDescription
-            })
-    }
-
-    // CRUD
-    func add(title: String) {
-        let it = Item(title: title)
-        FirebaseManager.itemsRef(uid: uid).child(it.id).setValue(it.asDict)
-    }
-    func update(item: Item, newTitle: String) {
-        FirebaseManager.itemsRef(uid: uid).child(item.id).updateChildValues(["title": newTitle])
-    }
-    func delete(item: Item) {
-        FirebaseManager.itemsRef(uid: uid).child(item.id).removeValue()
-        if let url = item.imageURL.flatMap(URL.init(string:)) {
-            Storage.storage().reference(forURL: url.absoluteString).delete(completion: nil)
-        }
-    }
-
-    // Upload image → Storage, then save download URL back to item
-    func uploadImage(_ image: UIImage, for item: Item) {
-        guard let data = image.jpegData(compressionQuality: 0.85) else {
-            errorMessage = "Could not encode image."; return
-        }
-        isUploading = true; uploadProgress = 0
-
-        let ref = FirebaseManager.itemImagesRef(uid: uid)
-            .child("\(item.id)_\(UUID().uuidString).jpg")
-        let meta = StorageMetadata(); meta.contentType = "image/jpeg"
-
-        let task = ref.putData(data, metadata: meta)
-
-        task.observe(.progress) { [weak self] s in
-            if let frac = s.progress?.fractionCompleted {
-                Task { @MainActor in self?.uploadProgress = frac }
-            }
-        }
-        task.observe(.success) { [weak self] _ in
-            ref.downloadURL { url, err in
-                Task { @MainActor in
-                    self?.isUploading = false; self?.uploadProgress = 1
-                    if let u = url {
-                        FirebaseManager.itemsRef(uid: self?.uid ?? "")
-                            .child(item.id)
-                            .updateChildValues(["imageURL": u.absoluteString])
-                    } else if let err { self?.errorMessage = err.localizedDescription }
+                // Debug to confirm imageURL is being parsed
+                if let first = list.first {
+                    print("DEBUG AppItem.imageURL:", first.imageURL ?? "nil")
                 }
             }
         }
-        task.observe(.failure) { [weak self] s in
-            Task { @MainActor in
-                self?.isUploading = false
-                self?.errorMessage = s.error?.localizedDescription ?? "Upload failed."
+    }
+
+    // MARK: - CRUD
+    func add(title: String) {
+        guard let ref = baseRef else { return }
+        let item = AppItem(title: title)
+        ref.child(item.id).setValue(item.asDict)
+    }
+
+    func updateTitle(_ item: AppItem, to newTitle: String) {
+        guard let ref = baseRef else { return }
+        ref.child(item.id).updateChildValues(["title": newTitle])
+    }
+
+    func delete(_ item: AppItem) {
+        baseRef?.child(item.id).removeValue()
+    }
+
+    // MARK: - Upload image (stable callback version)
+    func attachImage(_ image: UIImage, to item: AppItem) {
+        guard let uid = uid, let baseRef = baseRef else {
+            notice = "No user signed in."
+            return
+        }
+        guard let data = image.jpegData(compressionQuality: 0.85) else {
+            notice = "Image encoding failed."
+            return
+        }
+
+        isUploading = true
+        uploadProgress = 0
+        notice = "Uploading image…"
+
+        let filename = "\(UUID().uuidString).jpg"
+        let storageRef = Storage.storage().reference()
+            .child("users")
+            .child(uid)
+            .child("item-images")
+            .child(filename)
+
+        let meta = StorageMetadata()
+        meta.contentType = "image/jpeg"
+
+        // Start upload
+        let uploadTask = storageRef.putData(data, metadata: meta) { [weak self] _, error in
+            guard let self else { return }
+
+            if let error = error {
+                DispatchQueue.main.async {
+                    self.isUploading = false
+                    self.notice = "Upload failed: \(error.localizedDescription)"
+                }
+                return
+            }
+
+            // Get download URL and save it into the item's node
+            storageRef.downloadURL { url, err in
+                if let err = err {
+                    DispatchQueue.main.async {
+                        self.isUploading = false
+                        self.notice = "Failed to get URL: \(err.localizedDescription)"
+                    }
+                    return
+                }
+
+                guard let url = url else {
+                    DispatchQueue.main.async {
+                        self.isUploading = false
+                        self.notice = "URL missing after upload."
+                    }
+                    return
+                }
+
+                baseRef.child(item.id).updateChildValues(["imageURL": url.absoluteString])
+
+                DispatchQueue.main.async {
+                    self.isUploading = false
+                    self.uploadProgress = 1
+                    self.notice = "Image uploaded successfully."
+                }
+            }
+        }
+
+        // Progress (explicit snapshot type fixes “cannot infer” errors)
+        uploadTask.observe(.progress) { (snapshot: StorageTaskSnapshot) in
+            if let p = snapshot.progress {
+                DispatchQueue.main.async {
+                    self.uploadProgress = Double(p.completedUnitCount) / Double(p.totalUnitCount)
+                }
             }
         }
     }
